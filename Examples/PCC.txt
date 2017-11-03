@@ -1,0 +1,224 @@
+CreditManager Rate_Limiter (Flock f){
+	expose Float r;
+	expose Int cap;
+	Int tokens, last_time = now;
+
+	def deq_criteria(Packet pkt): Pred{
+		return (pkt.send_time = now);
+	}
+
+	def on_enqueue(Packet pkt) : void{
+		tokens = tokens + r * ( now - last_time )
+		if (tokens > cap){
+			tokens = cap;
+		}
+		if (pkt.length <= tokens){
+			pkt.send_time = now;
+		}
+		else{
+			pkt.send_time = now + ( pkt.length - tokens ) / r;
+		}
+		tokens = tokens - pkt.length;
+		last_time = now;
+	}
+
+	def on_dequeue(Packet pkt) : void {}
+}
+
+Metric new_ack (Flock f){
+	Int val;
+
+	def init() : void {
+		val = 0;
+	}
+
+	def update(f.ack_rcvd meta){
+		if (meta.pkt.tcp.seq > f.max_ack){
+			val = 1;
+		}
+	}
+
+	def val(): Int {
+		return val;
+	}
+}
+
+Metric avg_rtt (Flock f){
+	Float sum_rtt;
+	Int sample_cnt;
+
+	def init() : void {
+		val = 0;
+		start_time = 0;
+	}
+
+	def update(rising(f.new_ack, 0) pkt) : void{
+		sum_rtt += pkt.rtt;
+		sample_cnt += 1;
+	}
+
+	def Val() : Float{
+		return (sum_rtt / sample_cnt);
+	}
+
+}
+
+Metric max_sent (Flock f){
+	Int val;
+
+	def init() : void {
+		val = 0;
+	}
+
+	def update(f.pkt_sent pkt) : void{
+		if (pkt.tcp.seq > val){
+			val = pkt.tcp.seq;
+		}
+	}
+
+	def Val() : Int{
+		return val;
+	}
+}
+
+Metric acked_pkts (Flock f){
+	Int val, last_seq;
+
+	def init() : void{
+		val = 0
+		last_seq = f.init_seq;
+	}	
+
+	def update(rising(f.new_ack, 0) pkt){
+		val += pkt.tcp.seq - last_seq;
+		last_seq = pkt.tcp.seq;
+	}
+
+	def Val() : Int{
+		return val;
+	}
+}
+
+ASM PCC(Flock f, Param params){
+	Bool more, decided;
+	Float epsilon;
+	Float prev_rate;
+	Float u1, u2, u3, u4, prev_u, u;
+	Float alpha;
+
+	Float loss_rate;
+	Int start_max_sent, start_acked_pkts;
+
+	Timer t;
+
+	State Idle{
+		t.reset(f.avg_rtt);
+	};
+
+	State Normal{
+		start_max_sent = f.max_sent;
+		start_acked_pkts = f.acked_pkts;
+		if (more){
+			f.cm.r = f.cm.r * (1 + epsilon);
+		}
+		else{
+			f.cm.r = f.cm.r * (1 - epsilon);
+		}
+		t.reset(f.avg_rtt);
+	};
+
+	State Check{
+		prev_u = u;
+		loss_rate = (f.acked_pkts - start_acked_pkts) /
+					(f.max_sent - start_max_sent);
+		u = f.cm.r * (1 - loss_rate) * 
+			 1 / (1 + e ** (alpha * loss_rate - 0.05)) 
+			 - f.cm.r * loss_rate;
+	};
+
+	State Test1{
+		start_max_sent = f.max_sent;
+		start_acked_pkts = f.acked_pkts;
+		prev_rate = f.cm.r;
+		f.cm.r = f.cm.r * (1 + epsilon);
+		t.reset(f.avg_rtt); 
+	};
+
+	State Test2{
+		loss_rate = (f.acked_pkts - start_acked_pkts) /
+					(f.max_sent - start_max_sent);
+		u1 = f.cm.r * (1 - loss_rate) * 
+			 1 / (1 + e ** (alpha * loss_rate - 0.05)) 
+			 - f.cm.r * loss_rate;
+
+		start_max_sent = f.max_sent;
+		start_acked_pkts = f.acked_pkts;
+		prev_rate = f.cm.r;
+		f.cm.r = f.cm.r * (1 - epsilon);
+		t.reset(f.avg_rtt);
+	};
+
+	State Test3{
+		loss_rate = (f.acked_pkts - start_acked_pkts) /
+					(f.max_sent - start_max_sent);
+		u2 = f.cm.r * (1 - loss_rate) * 
+			 1 / (1 + e ** (alpha * loss_rate - 0.05)) 
+			 - f.cm.r * loss_rate;
+
+		start_max_sent = f.max_sent;
+		start_acked_pkts = f.acked_pkts;
+		prev_rate = f.cm.r;
+		f.cm.r = f.cm.r * (1 + epsilon);
+		t.reset(f.avg_rtt);
+	};
+
+	State Test4{
+		loss_rate = (f.acked_pkts - start_acked_pkts) /
+					(f.max_sent - start_max_sent);
+		u3 = f.cm.r * (1 - loss_rate) * 
+			 1 / (1 + e ** (alpha * loss_rate - 0.05)) 
+			 - f.cm.r * loss_rate;
+
+		start_max_sent = f.max_sent;
+		start_acked_pkts = f.acked_pkts;
+		prev_rate = f.cm.r;
+		f.cm.r = f.cm.r * (1 + epsilon);
+		t.reset(f.avg_rtt);
+	};
+
+	State Decide{
+		loss_rate = (f.acked_pkts - start_acked_pkts) /
+					(f.max_sent - start_max_sent);
+		u4 = f.cm.r * (1 - loss_rate) * 
+			 1 / (1 + e ** (alpha * loss_rate - 0.05)) 
+			 - f.cm.r * loss_rate;
+		if (u1 > u && u3 > u){
+			more = True;
+			decided = True;
+		}
+		else if (u2 > u && u4 > u){
+			more = False;
+			decided = True;
+		}
+		else{
+			decided = False;
+		}
+	}
+
+	Init Test1;
+
+	Transtions{
+		| Idle on t.timeout ==> Check
+		| Normal on t.timeout ==> Check
+		| Check on always if u >= prev_u && decided ==> Normal
+		| Check on always if u >= prev_u && !decided ==> Idle
+		| Check on always if u < prev_u ==> Test1
+		| Test1 on t.timeout ==> Test2
+		| Test2 on t.timeout ==> Test3
+		| Test3 on t.timeout ==> Test4
+		| Test4 on t.timeout ==> Decide
+		| Decide on always if decided ==> Normal
+		| Decide on always if !decided ==> Idle
+	}
+}
+
