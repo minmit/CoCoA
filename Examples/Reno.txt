@@ -1,0 +1,209 @@
+CreditManager Sliding_Window (Flock f){
+	expose Float window_size;
+	Int start;
+
+	def deq_criteria(Packet pkt): Pred {
+		return (pkt.tcp.seq >= start && 
+		        pkt.tcp.seq < start + window_size);
+	}
+
+	def on_enqueue(Packet pkt) : void {}
+	def on_dequeue(Packet pkt) : void {}
+	def on_ack_rcvd(Packet pkt) : void {
+		if (pkt.tcp.seq >= start &&
+		    pkt.tcp.seq < start + window_size){
+		    start = pkt.tcp.seq;
+		}
+	}
+}
+
+Metric max_ack (Flock f){
+	Int val;
+
+	def init() : void {
+		val = 0;
+	}
+
+	def update(f.ack_rcvd meta){
+		if (meta.pkt.tcp.seq > val){
+			val = meta.pkt.tcp.seq;
+		}
+	}
+
+	def val(){
+		return val;
+	}
+}
+
+Metric new_ack (Flock f){
+	Int val;
+
+	def init() : void {
+		val = 0;
+	}
+
+	def update(f.ack_rcvd meta){
+		if (meta.pkt.tcp.seq > f.max_ack){
+			val = 1;
+		}
+	}
+
+	def val(): Int {
+		return val;
+	}
+}
+
+
+Metric dup_acks (Flock f){
+	Int val;
+	Int last_ack;
+
+	def init() : void {
+		last_ack = None;
+		val = 0;
+	}
+
+	def update(f.ack_rcvd meta){
+		Int new_ack = meta.pkt.tcp.seq;
+		if (last_ack == None){
+			last_ack = new_ack;
+		}
+		else if (last_ack == new_ack){
+			val += 1;		
+		}
+		else if (new_ack > last_ack){
+			last_ack = new_ack;
+			val = 0;
+		}
+	}
+
+	def val() : Int{
+		return val;
+	}
+}
+
+
+
+Metric max_sent (Flock f){
+	Int val;
+
+	def init() : void {
+		val = 0;
+	}
+
+	def update(f.pkt_sent meta){
+		if (meta.pkt.tcp.seq > val){
+			val = meta.pkt.tcp.seq;
+		}
+	}
+
+	def val() : Int {
+		return val;
+	}
+}
+
+
+
+Metric rtx_timeout (Flock f){
+	Int val;
+	Timer t;
+	Int timeout_interval = 200ms;
+
+	def init() : void {
+		val = 0;
+	}
+
+	def update(f.pkt_sent meta) : void { 
+        if (!t.is_set() && max_sent > max_ack){
+            t.set(timeout_interval);
+        }
+    }
+	
+    def update(rising(f.new_ack, 0) meta) : void {
+		val = 0;
+		t.set(timeout_interval);
+	}
+
+	def update((f.ack_rcvd if f.dup_acks == 3) meta) : void {
+		val = 0;
+		t.set(timeout_interval);
+	}
+
+	def update(t.timeout meta) : void {
+		val = 1;
+		t.set(timeout_interval);
+	}
+
+	def val() : Int{
+		return val;
+	}
+}
+
+
+ASM tcp_reno(Flock f, Param params){
+	Float tmp_win; 
+	Int recovery_seq;
+	Float ss_threshold = 2 * params.ssthresh;
+
+	State Start{
+		tmp_win = 1;
+		f.cm.window_size = 1;
+		recovery_seq = f.max_sent;
+		ss_threshod /= 2;
+	}
+
+	State SlowStart {
+		tmp_win += 1;
+		f.cm.window_size += 1;
+	};
+
+	State AI {
+		f.cm.window_size = tmp_win;
+		f.cm.window_size += 1/f.cm.window_size;
+		tmp_win += 1/tmp_win;
+	};
+
+	State MD {
+		recovery_seq = 0;
+		tmp_win = f.cm.window_size / 2;
+		ss_threshold = tmp_win;
+		f.cm.window_size = tmp_win + f.dup_acks;
+	};
+
+	State FR{
+		f.cm.window_size = tmp_win + f.dup_acks;
+	};
+
+	State Idle {};
+
+	Init Start;
+
+	Transitions{
+		| Start on rising(f.new_ack, 0) ==> SlowStart
+		
+		| SlowStart on rising(f.new_ack, 0) if f.cm.window_size < ss_threshold ==> SlowStart
+		| SlowStart on rising(f.new_ack, 0) if f.cm.window_size >= ss_threshold ==> AI
+		| SlowStart on f.ack_rcvd if f.dup_acks == 3 && f.max_ack > recovery_seq ==> MD
+		| SlowStart on f.ack_rcvd if f.dup_acks == 3 && f.max_ack <= recovery_seq ==> Idle
+		| SlowStart on rising(f.rtx_timeout, 0) ==> Start
+
+		| AI on rising(f.new_ack, 0) ==> AI
+		| AI on f.ack_rcvd if f.dup_acks == 3 && f.max_ack > recovery_seq ==> MD
+		| AI on f.ack_rcvd if f.dup_acks == 3 && f.max_ack <= recovery_seq ==> Idle
+		| AI on rising(f.rtx_timeout, 0) ==> Start
+
+		| MD on rising(f.new_ack, 0) ==> AI
+		| MD on f.ack_rcvd if f.dup_acks > 0 ==> FR
+		| MD on rising(f.rtx_timeout, 0) ==> Start
+
+		| FR on rising(f.new_ack, 0) ==> AI
+		| FR on f.ack_rcvd if f.dup_acks > 0 ==> FR
+		| FR on rising(f.rtx_timeout, 0) ==> Start
+
+		| Idle on rising(f.new_ack, 0) if f.cm.size < ss_threshold ==> SlowStart
+		| Idle on rising(f.new_ack, 0) if f.cm.size >= ss_threshold ==> AI
+		| Idle on rising(f.rtx_timeout, 0) ==> Start
+	};
+	
+}
+   
