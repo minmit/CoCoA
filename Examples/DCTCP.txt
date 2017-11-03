@@ -36,7 +36,27 @@ Metric new_ack (Flock f){
 }
 
 Metric window_transmitted (Flock f){
-	
+	Bool val; 
+	Int start, size;
+
+	def init() : void {
+		val = False;
+	}	
+
+	def update(f.ack_rcvd meta) : void {
+		if (meta.pkt.tcp.seq >= start + size){
+			val = True;
+			start = start + size;
+			size = f.cm.window_size;
+		}
+		else{
+			val = False;
+		}
+	}
+
+	def Val() : Bool {
+		return val;
+	}
 }
 
 Metric alpha (Flock f){
@@ -58,7 +78,7 @@ Metric alpha (Flock f){
 		}
 	}
 
-	def update(f.window_transmitted e) : void {
+	def update((f.ack_rcvd if f.window_transmitted) e) : void {
 		val = (1 - g) * val + g * (marked / all);
 		all = 0;
 		marked = 0;
